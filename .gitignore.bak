@@ -138,7 +138,7 @@ Data/*.png
 Data/*.jpeg
 Data/*.h5
 Data/*.hdf5
-Data/Output/*
+
 
 
 

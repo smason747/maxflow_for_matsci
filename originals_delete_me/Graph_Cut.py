@@ -31,7 +31,7 @@ def make_a_guess(img, past_guesses):
     return choice, past_guesses
 
 
-orig_img = np.array(Image.open('median.tiff'), dtype='int16')
+orig_img = np.array(Image.open('../Data/median.tiff'), dtype='int16')
 # Right off the bat, give the background a special unique color -1. from now
 # on, things with negative values are already segmented
 img = skseg.flood_fill(orig_img, (0, 0), -1)

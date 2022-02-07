@@ -233,3 +233,37 @@ def ff_clean_and_label(img, min_spot_size, nn):
     # Now relabel them so every spot has its own ID.
     labeled_spots = ndimage.label(dialate2, mask)[0]
     return(labeled_spots)
+
+
+def grain_label(img, min_spot_size, nn, existing_grain_count):
+    """
+    clean_and_label the image
+    Its late and im tired. put better description later
+    """
+    mask = VN_masks[nn]
+    # segment boolean array
+    init_label = ndimage.label(img, mask)[0]
+    # get a count of how big each segmented object is
+    ID, count = np.unique(init_label, return_counts=True)
+    # make a dictionary to filter out grains below minimum size threshold
+    large_ID = (ID*(count > min_spot_size)*-1)-existing_grain_count
+    large_ID[large_ID >= existing_grain_count] = 0
+    big_filter = dict(zip(ID, large_ID))
+    final_label = np.vectorize(big_filter.__getitem__)(init_label)
+    return(final_label)
+
+
+def make_a_guess(img, past_guesses):
+    med_img = ndimage.median_filter(img, size=2)
+    choices = med_img[med_img >= 0]
+    count = np.histogram(choices, bins=np.arange(-0.5, 256.5))[0]
+    count[past_guesses] = 0
+    if np.sum(count) == 0:
+        past_guesses = []
+        count = (np.histogram(choices, bins=np.arange(-0.5, 256.5))[0])**3
+        print("      BEANS!!!!")
+    count = count/np.linalg.norm(count)
+    choice = np.random.choice(np.arange(256), 1, p=(count.astype(float))**2)[0]
+#    choice = choices[np.random.randint(choices.size)]
+    past_guesses.append(choice)
+    return choice, past_guesses

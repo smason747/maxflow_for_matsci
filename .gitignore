@@ -138,7 +138,14 @@ Data/*.png
 Data/*.jpeg
 Data/*.h5
 Data/*.hdf5
+*.tif*
+*.ang
+*.png
+*.jpeg
+*.h5
+*.hdf5
 Data/Output/*
+!Data/ff_hedm.tif
 
 
 

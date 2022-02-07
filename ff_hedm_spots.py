@@ -8,10 +8,11 @@ Example on how to use graph cut to pull spots from a ff-HEDM scan.
 """
 
 import numpy as np
-from scipy import ndimage
 import matplotlib.pyplot as plt
-import maxflow  # NOTE, this is "pip install pymaxflow", NOT "pip install maxflow"
+import maxflow  # NOTE, "pip install pymaxflow", NOT "pip install maxflow"
 import functions as fn
+from PIL import Image
+import os
 
 # ========================================================================= #
 # USER INPUTS
@@ -20,145 +21,164 @@ import functions as fn
 # when testing this concept out. Users are encouraged to modify them and watch
 # how the cuts change
 
-filenames = "ff_*.tif*"  # text or list of text; accepts wildcard statements
-
-# In-plane (IP) weighting (how much pixels want to group with their neighbors)
-curve = 0.8  # how "sharp" the weighting curve is. higher = more exclusive
-cutoff = 100  # intra-pixel deltas larger than this get the min IP weighting
-IP_min = 0.2  # minimum IP connection weight, as a fraction of the maximum
-
-# Out-of-plane (OP) weighting (how strongly pixels are pulled on during cut)
-high_threshold = 150  # intensities above this are given this value
+filenames = "Data/ff_*.tif*"  # text or list of text; accepts wildcards
+high_threshold = 200  # intensities above this are given this value
 low_threshold = 5  # intensities below this are given this value
 
+# In-plane (IP) weighting (how much pixels want to group with their neighbors)
+IP_curve = 0.8  # how "sharp" the weighting curve is. higher = more exclusive
+cutoff = 100  # intra-pixel deltas larger than this get the min IP weighting
+IP_min = 0.2  # minimum IP connection weight, as a fraction of the maximum
+IP_nn = 4  # number of nearest neighbors to consider for IP connections
+
+# Out-of-plane (OP) weighting (how strongly pixels are pulled on during cut)
+OP_curve = 10
+OP_strength = 1
+inverse = True
+
 # Post Processing
-min_dialated_spot_size = 9  # Don't go below 9, things will break
+dialation_steps = 2  # number of times result is dialated before segmentation
+dialation_nn = 4  # number of nearest neighbors to consider for dialation
+min_spot_size = 36  # Don't go below 9, things will break
+
+# Saving data
+save_as_img = False
+save_as_txt = False
 
 # visualization tools (switch off for large processes)
 show_weighting_equations = True
 show_IP_map = True
 show_OP_map = True
-save_images = True
+show_original = True
+show_pre_clean = True
+show_filtered = True
+show_labeled = True
 # ========================================================================= #
 
 
-plt.close('all')
+#plt.close('all')
 
 # load up all the files from filenames as a list of float32 numpy arrays
 image_stack, files = fn.load_images(filenames)
 
 # loop through every image in the stack and perform the graph cut
-for i_count, img in enumerate(image_stack):
+for i_count, orig_img in enumerate(image_stack):
     # Only need to do a single graph cut to seperate out the spots.
     print("\n\n{}\n working on image {}\n".format("="*40, files[i_count]))
-    # Make an empty graph using a rough estimate of the expected graph size
+
+    # Pre-process image according to thresholds
+    img = orig_img*1
+    img[img < low_threshold] = low_threshold
+    img[img > high_threshold] = high_threshold
+
+    # Make an empty graph,then exclude any pixels too dark to even consider.
+    # NOTE: don't worry if we take out a few important oddball pixels here,
+    # we are going to do a dialation step at the end to regrab them.
     N = img.size
     g = maxflow.GraphFloat(N, N*4)
+    nodeids = g.add_grid_nodes(img.shape)
+    nodeids[img < low_threshold] = -1
 
-    # Pre-process image according to thresholds, return a 0-256 range
+    print("Building the graph...")
+    # Add the Out-of-Plane weights. since IP weights are all auto-weighted to
+    # max out at one, increasing or reducing these weights will control how
+    # strongly the source and sink can "pull" a pixel to them versus the pull
+    # felt from the In-Plane connections
+    source, sink = fn.calc_OP_weights(img, high_threshold, OP_curve, inverse)
+    # apply the weights
+    g.add_grid_tedges(nodeids, sink*OP_strength, source*OP_strength)
 
     # Add the In-Plane weights. All connections are  between 0 and 1.
     # Two notes:
     # 1) If users want to try an initial median filter to remove noise, this
     #    Is where to insert that. Personally, I found no improvement and maybe
-    #    even harm in adding one, but maybe other files will be different
-    # 2) Here, the IP weights are taken from a weighted sobel filter, but a
-    #    standard graph cut just uses a delta function. change the "style" to
-    #    see how different styles change the results, and/or add your own.
-    g, IP_mesh = fn.add_IP(g, img, curve, cutoff, IP_min, style='sobel_w')
+    #    even harm in adding one, but maybe other images will be different
+    # 2) Here, the IP weights are calculated from the delta between neighboring
+    #    pixels, but a sobel filter is also common. Change "style" to "sobel"
+    #    see how the results change, and/or add your own.
+    IP_ws, neigh_map = fn.calc_IP_weights(img, IP_curve, cutoff,
+                                          IP_min, IP_nn, style='sobel')
+    # Extra IP_weighting step specifically for ff_HEDM data. I found that if
+    # I took the IP connections, multiplied them by their intensity, then
+    # renormalized, I got much better results (IE, neighbors that are similar
+    # AND have a high luminosity have stronger bonds than background pixels).
+    # specifically, this did a good job of not accidentally dragging along
+    # noisy background areas. It DID drop a few parts of the actual spots, but
+    # we get them back during the dialation phase.
+    likelyhood = (img - low_threshold)/(high_threshold-low_threshold)
+    likelyhood[likelyhood<0.5] = 0.5
+    IP_ws = [x*likelyhood for x in IP_ws]
+    IP_ws = [x/(x.max()) for x in IP_ws]
+    # apply the weights
+    for neigh, IP_w in enumerate(IP_ws):
+        g.add_grid_edges(nodeids, IP_w, neigh, symmetric=True)
 
-    # Add the Out-of-Plane weights. All connections are between 0 and 1.
-    g, OP_mesh = fn.add_OP_weights(g, img, 256)
+    print("Computing the cut...")
+    g.maxflow()  # does the actual cut, saves edge capacities as part of graph
+    sgm_in = np.arange(N).reshape(img.shape)
+    sgm = g.get_grid_segments(sgm_in)  # boolean map of the foreground
 
-# Original below here, need to copy then erase
+    print("Post Processing the cut...")
+    # This result is okay, but not great. We need to clean them up some.
+    # First, dialate all the spots to connect regions
+    dialated = fn.dialate_mask(sgm, dialation_steps, dialation_nn)
 
-a = '''
-# plt.close('all')
-# check that there are files matching the filename search text
-assert len(glob.glob(filenames)) > 0, "no files found matching the search term"
-# load up all the images into a list of numpy arrays
-images = [np.array(Image.open(img))[:, :, 0]for img in glob.glob(filenames)]
+    # Remove spots below the minimum threshold and assign labels
+    good_spots = fn.ff_clean_and_label(dialated, min_spot_size, dialation_nn)
+    filtered = orig_img*(good_spots != 0)
 
+    print("Saving and visualization...")
+    # at this point, save any outputs the user requested to the Output folder
+    sname = "".join(files[0].split(os.sep)[-1].split(".")[:-1])
+    savename = "Data/Output/" + sname
+    if save_as_img:
+        Image.fromarray(filtered).save(savename + "_out.tif")
+        Image.fromarray(good_spots).save(savename + "_labeled.tif")
+    if save_as_txt:
+        np.savetxt(savename + "_out.txt", filtered)
+        np.savetxt(savename + "labeled.txt", good_spots)
 
-for i_count, img in enumerate(images):
-    print("graph cutting {} ...".format(glob.glob(filenames)[i_count]))
-    IP_img = img*1
-    IP_img[IP_img < low_threshold] = low_threshold
-    IP_img[IP_img > high_threshold] = high_threshold
+# ================================================== #
+# Graphing stuff (no calculations, can be ignored)
+# ================================================== #
+    # add some graphs users can turn on and off to help with comprehension
+    if show_weighting_equations:
+        fig_name = "img{} IP and OP weighting equations".format(i_count+1)
+        diff = high_threshold - low_threshold
+        hi_lo = np.arange(0, diff, 0.01)
+        hl_source, hl_sink = fn.calc_OP_weights(hi_lo, 150, OP_curve, inverse)
+        IP_line = (hi_lo*0 + diff)**IP_curve - (hi_lo**IP_curve)
+        IP_line = IP_line/IP_line.max()
+        fig, ax = plt.subplots(num=fig_name)
+        l1, = ax.plot(hi_lo, IP_line, 'b', label='In-Plane weights')
+        l2, = ax.plot(hi_lo, hl_source, 'r', label='source weights')
+        l3, = ax.plot(hi_lo, hl_sink, 'g', label='sink weights')
+        ax.grid()
+        ax.set_xlim(-0.01, diff+0.01)
+        ax.set_ylim(-0.01, np.max([source.max(), IP_line.max()])+0.01)
+        ax.legend(handles=[l1, l2, l3])
+    if show_IP_map:
+        plt.figure("In-Plane connection map (averages)")
+        plt.imshow(np.stack(IP_ws, axis=2).mean(axis=2))
+#        plt.imsave(savename+"_IP.png", IP_ws)
+    if show_OP_map:
+        plt.figure("Out-Of-Plane connection map")
+        plt.imshow(source)  # [2050:2350,3200:3500])
+#        plt.imsave(savename+"_OP.png", source)
+    if show_original:
+        plt.figure("Original Image")
+        plt.imshow(orig_img)  # [2050:2350,3200:3500])
+#        plt.imsave(savename+"_orig.png", orig_img)
+    if show_pre_clean:
+        plt.figure("Image before Post")
+        plt.imshow(sgm)  # [2050:2350,3200:3500])
+#        plt.imsave(savename+"_pre_clean.png", orig_img)
+    if show_filtered:
+        plt.figure("original spots with background removed")
+        plt.imshow(filtered)  # [2050:2350,3200:3500])
+    if show_labeled:
+        plt.figure("labeled spots")
+        plt.imshow(good_spots)  # [2050:2350,3200:3500])
 
-    # Find the Out-of-plane weights
-    print("Generating graph weights")
-    likelyhood = (IP_img - low_threshold)/(high_threshold-low_threshold)
-    OP_wts = (likelyhood**0.5)*(cutoff**curve)*10
-
-    # Find the in-plane weights
-    LR_delta = np.abs(IP_img[:, 1:] - IP_img[:, :-1])
-    UD_delta = np.abs(IP_img[1:, :] - IP_img[-1:, :])
-    LR_weight = (cutoff**curve) - (LR_delta**curve)
-    UD_weight = (cutoff**curve) - (UD_delta**curve)
-    LR_weight[LR_weight <= noise_threshold] = noise_threshold
-    UD_weight[UD_weight <= noise_threshold] = noise_threshold
-    LR_weight = np.hstack([LR_weight, np.zeros([img.shape[0], 1])])
-    UD_weight = np.vstack([UD_weight, np.zeros([1, img.shape[1]])])
-    LR_weight = LR_weight*(1-likelyhood)
-    UD_weight = UD_weight*(1-likelyhood)
-
-    # make the actual graph and remove obviously bad pixels
-    print("Building the graph")
-    N = img.size
-    g = maxflow.GraphFloat(N, N*4)
-    nodeids = g.add_grid_nodes(img.shape)
-    nodeids[img < low_threshold] = -1
-    # add the edges (ignoring nodes below threshold for speed)
-    g.add_grid_tedges(nodeids, OP_wts.max() + 1 - OP_wts, OP_wts)
-    g.add_grid_edges(nodeids, LR_weight, LR_struct, symmetric=True)
-    g.add_grid_edges(nodeids, UD_weight, UD_struct, symmetric=True)
-
-    # Graph is complete. Do the maxflow and grab the "pulled out" stuff
-    print("Computing the cut")
-    g.maxflow()
-    sgm = g.get_grid_segments(np.arange(N).reshape(img.shape))
-
-    # This result is okay, but not great. Lets clean it up.
-    print("Post Processing")
-    # First, dialate all the spots to connect same-spot regions
-    dialated = ndimage.binary_dilation(sgm, mask_8)
-    # Remove all the small spots that didn't have nearby neghbors
-    labeled = ndimage.label(sgm, [[0, 1, 0], [1, 0, 1], [0, 1, 0]])[0]
-    ID, count = np.unique(labeled, return_counts=True)
-    large_ID = ID*(count > min_dialated_spot_size)
-    old_to_new_id = dict(zip(ID[count > 1], np.arange(len(ID[count > 1]))))
-    new_ID = np.vectorize(old_to_new_id.__getitem__)(large_ID)
-    translator = dict(zip(ID, new_ID))
-    good_spots = np.vectorize(translator.__getitem__)(labeled)
-    # Dialate things again twice so you get a 2 pixel buffer around every spot
-    dialated_spot_map = ndimage.binary_dilation(good_spots, mask_8)
-    dialated_spot_map = ndimage.binary_dilation(dialated_spot_map, mask_8)
-    # Now relabel them so every spot has its own ID.
-    good_labeled_spots = ndimage.label(dialated_spot_map, mask_4)[0]
-
-    # Now a couple graphs to see what we did.
-    plt.figure("Original")
-    plt.imshow(img)  # [2130:2200,3250:3320])
-    plt.figure("IP_weights")
-    plt.imshow(-1*(LR_weight + UD_weight))
-    plt.figure("OP_weights")
-    plt.imshow(OP_wts)
-    plt.figure("filtered")
-    plt.imshow((img*(dialated_spot_map > 0)))
-    plt.figure("Segmented")
-    plt.imshow(good_labeled_spots)
-
-    # Save out those images as well
-    plt.imsave("Original_{}.tiff".format(i_count), img)
-    plt.imsave("IP_weights_{}.tiff".format(i_count),
-               256 - (1*(LR_weight + UD_weight)))
-    plt.imsave("OP_weights_{}.tiff".format(i_count), OP_wts)
-    plt.imsave("Filtered_{}.tiff".format(i_count),
-               img*(dialated_spot_map > 0))
-    plt.imsave("Segmented_{}.tiff".format(i_count), good_labeled_spots)
-
-    print("Donezo!!!")  
-    
-    
-    '''
+    print(files[i_count]+" Complete")
+print("DONEZO!")
